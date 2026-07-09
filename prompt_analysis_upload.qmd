@@ -1,0 +1,1078 @@
+```{r}
+#| include: false
+#| echo: false
+# load packages
+library(dplyr)
+library(ggplot2)
+library(readr)
+library(lubridate)
+library(stringr)
+library(tidyr)
+library(patchwork)
+library(gtsummary)
+library(cowplot)
+library(gt)
+library(readxl)
+library(knitr)
+library(kableExtra)
+library(lme4)
+library(glmmTMB)
+library(marginaleffects)
+library(broom.mixed)
+library(officer)
+library(flextable)
+```
+
+## Cases
+
+```{r, fig.width = 9, fig.height=5}
+#| echo: false
+#| warning: false
+
+#upload db final database -> db_analysis_20may2026.csv
+
+#outbreak sizes by home and unit
+outbreak_size <- db_final %>%
+  filter(outbreak_size!=1) %>% #remove those with only one case
+  group_by(home, unit, virus, outbreak_num, allocation_f, beds,
+           outbreak_start, outbreak_end) %>%
+  mutate(timing = as.numeric(difftime(case_symp_onset_f,
+                                      outbreak_start,
+                                      units = "days")),
+         suspect_case = replace_na(suspect_case, 0)) %>%
+  dplyr::summarize(outbreak_size=n(),
+            outbreak_size_secondary=sum(timing>0), 
+            outbreak_size_confirmed=sum(suspect_case==0),
+            outbreak_size_secondary_confirmed = sum(suspect_case == 0 & timing > 0),
+            outbreak_size_secondary_suspect=sum(suspect_case==1 & timing >0)) %>%
+  group_by(home) %>%
+  mutate(total_outbreaks=n(),
+         home_outbreak_number=row_number()) %>%
+  ungroup() 
+
+#outbreak duration in days
+outbreak_size_y <- outbreak_size %>%
+  filter(outbreak_size!=1) %>% #remove those with only one case
+  mutate(outbreak_duration = as.numeric(outbreak_end-outbreak_start))
+
+#find overlapping outbreaks
+outbreak_size_y_overlap <- outbreak_size_y %>%
+  arrange(home, unit, outbreak_start) %>%
+  group_by(home, unit) %>%
+  mutate(
+    # Get lag and lead start/end
+    prev_start = lag(outbreak_start),
+    prev_end = lag(outbreak_end),
+    next_start = lead(outbreak_start),
+    next_end = lead(outbreak_end),
+
+    # Does current outbreak start during previous one?
+    overlaps_prev = !is.na(prev_start) & outbreak_start >= prev_start & outbreak_start <= prev_end,
+
+    # Does previous outbreak overlap with current? (so we can flag the previous row too)
+    overlaps_next = !is.na(next_start) & next_start >= outbreak_start & next_start <= outbreak_end,
+
+    # Flag if this outbreak overlaps with another (either way)
+    outbreak_overlap_flag = overlaps_prev | overlaps_next
+  ) %>%
+  ungroup()
+
+#make table
+# Normalize per 100 beds
+outbreak_norm <- outbreak_size_y %>%
+  mutate(allocation_beds = case_when(allocation_f=="Intervention" ~ 2113,
+                                    allocation_f=="Control" ~ 1850)) %>%
+  mutate(
+    sec_per_100   = (outbreak_size_secondary / allocation_beds) * 100,
+    conf_per_100  = (outbreak_size_secondary_confirmed / allocation_beds) * 100,
+    susp_per_100  = (outbreak_size_secondary_suspect / allocation_beds) * 100,
+    total_per_100   = (outbreak_size / allocation_beds) * 100,
+    total_conf_per_100  = (outbreak_size_confirmed / allocation_beds) * 100,
+    total_susp_per_100  = (outbreak_size_secondary_suspect / allocation_beds) * 100,
+    
+  )
+
+# Summary function with custom labels
+summarize_metric <- function(df, metric_col, label) {
+  overall <- df %>%
+    group_by(allocation_f) %>%
+    dplyr::summarize(value = sum(.data[[metric_col]], na.rm = TRUE), .groups = "drop") %>%
+    mutate(Cases = "  Overall", Section = label)   
+
+  by_virus <- df %>%
+    filter(virus %in% c("COVID", "FLU", "RSV")) %>%
+    mutate(
+      virus_label = case_when(
+        virus == "COVID" ~ "SARS-CoV-2",
+        virus == "FLU"   ~ "Influenza",
+        virus == "RSV"   ~ "RSV"
+      )
+    ) %>%
+    group_by(virus_label, allocation_f) %>%
+    dplyr::summarize(value = sum(.data[[metric_col]], na.rm = TRUE), .groups = "drop") %>%
+    rename(Cases = virus_label) %>%                     
+    mutate(
+      Cases = paste0("  ", Cases),                      
+      Section = label
+    )
+
+  bind_rows(overall, by_virus)
+}
+
+# Create summaries
+total_summary     <- summarize_metric(outbreak_norm, "total_per_100", "TOTAL")
+confirmed_summary <- summarize_metric(outbreak_norm, "total_conf_per_100", "CONFIRMED")
+suspect_summary   <- summarize_metric(outbreak_norm, "total_susp_per_100", "SUSPECT")
+
+# Combine all
+full_summary <- bind_rows(total_summary, confirmed_summary, suspect_summary)
+
+# Set desired row order
+cases_levels <- c("  Overall", "  SARS-CoV-2", "  Influenza", "  RSV")  # renamed variable
+
+# Final table preparation
+summary_clean <- full_summary %>%
+  pivot_wider(names_from = allocation_f,
+              values_from = value,
+              names_glue = "{allocation_f}") %>%
+  select(Section, Cases, Control, Intervention) %>%    
+  mutate(
+    Cases = factor(Cases, levels = cases_levels),      
+    Section = factor(Section, levels = c("TOTAL", "CONFIRMED", "SUSPECT"))
+  ) %>%
+  arrange(Section, Cases) %>%                          
+  mutate(across(where(is.numeric), ~ round(.x, 1)))
+
+# Final formatted table
+summary_clean %>%
+  select(Cases, Control, Intervention) %>%             
+  kable("latex", booktabs = TRUE, align = "lcc",
+        col.names = c("Cases", "Control", "Intervention"),   
+        caption = "Cases per 100 Beds by Allocation Group") %>%
+  kable_styling(latex_options = c("hold_position", "striped", "scale_down")) %>%
+  pack_rows("TOTAL", 1, 4, bold = TRUE, italic = FALSE) %>%
+  pack_rows("CONFIRMED", 5, 8, bold = TRUE, italic = FALSE) %>%
+  pack_rows("SUSPECT", 9, 12, bold = TRUE, italic = FALSE)
+```
+
+\newpage
+
+## Outbreak Sizes
+
+```{r table_summary, results='asis'}
+#| echo: false
+#| warning: false
+
+#outbreak duration in days
+outbreak_size_y <- outbreak_size %>%
+  filter(outbreak_size!=1) %>% #remove those with only one case
+  mutate(outbreak_duration = as.numeric(outbreak_end-outbreak_start),
+         outbreak_size_initial=as.integer(outbreak_size-outbreak_size_secondary),
+         outbreak_size_initial_confirmed=as.integer(outbreak_size_confirmed-outbreak_size_secondary_confirmed))
+
+#table
+outbreak_size_y %>% 
+  select(virus, allocation_f, outbreak_size, outbreak_size_initial,
+         outbreak_size_secondary, outbreak_size_confirmed,
+         outbreak_size_initial_confirmed,
+         outbreak_size_secondary_confirmed, outbreak_duration,) %>%
+  tbl_summary(
+    by = allocation_f,
+    statistic = list(
+      all_continuous() ~ "{median} ({p25}, {p75})",
+      all_categorical() ~ "{n} / {N} ({p}%)"
+    ),
+    type = list(outbreak_size_confirmed ~ "continuous",
+                outbreak_size_initial ~ "continuous",
+                outbreak_size_initial_confirmed ~ "continuous"),
+    digits = all_continuous() ~ 2,
+    missing_text = "(Missing)",
+    label=c(virus ~ "Virus",
+            outbreak_size ~ "Total Outbreak Size",
+            outbreak_size_confirmed ~ "Total Confirmed Outbreak Size",
+            outbreak_size_initial ~ "Initial Cases Per Outbreak",
+            outbreak_size_secondary ~ "Secondary Cases Per Outbreak",
+            outbreak_size_initial_confirmed ~ "Initial Confirmed Cases Per Outbreak",
+            outbreak_size_secondary_confirmed ~ "Secondary Confirmed Cases Per Outbreak",
+            outbreak_duration ~ "Outbreak Duration (days)")
+    ) %>%
+  add_overall() %>%
+  as_kable_extra(booktabs = TRUE)
+# as_gt() %>% gtsave(filename = "ae_table3.png") # to save output
+```
+
+```{r summary-table, results='asis', echo=FALSE}
+#| echo: false
+#| warning: false
+
+library(flextable)
+
+#add in by virus
+x <- outbreak_size %>% 
+  filter(outbreak_size!=1) %>% #remove those with only one case
+  mutate(outbreak_duration = as.numeric(outbreak_end-outbreak_start),
+         outbreak_size_initial=as.integer(outbreak_size-outbreak_size_secondary),
+         outbreak_size_initial_confirmed=as.integer(outbreak_size_confirmed-outbreak_size_secondary_confirmed)) %>% 
+  select(virus, allocation_f, outbreak_size, outbreak_size_initial,
+         outbreak_size_secondary, 
+         outbreak_size_confirmed, outbreak_size_initial_confirmed,
+         outbreak_size_secondary_confirmed, outbreak_duration) %>%
+  tbl_strata(
+    strata = virus,
+    .tbl_fun =
+      ~ .x |>
+      tbl_summary(by = allocation_f, 
+                  type = c(outbreak_size ~ "continuous",
+                           outbreak_duration ~ "continuous",
+                           outbreak_size_secondary ~"continuous",
+                           outbreak_size_initial ~ "continuous",
+                           outbreak_size_secondary_confirmed ~"continuous",
+                           outbreak_size_initial_confirmed ~ "continuous",
+                           outbreak_size_confirmed ~ "continuous"),
+                  statistic = list(
+                    all_continuous() ~ "{median} ({p25}, {p75})",
+                    all_categorical() ~ "{n} / {N} ({p}%)"
+                  ),
+                  digits = all_continuous() ~ 0,
+                  missing_text = "(Missing)",
+                  label=c(outbreak_size ~ "Total Outbreak Size",
+                          outbreak_size_initial ~ "Initial Cases Per Outbreak",
+                          outbreak_size_secondary ~ "Secondary Cases Outbreak Size",
+                          outbreak_size_initial_confirmed ~ "Initial Confirmed Cases Per Outbreak",
+            outbreak_size_secondary_confirmed ~ "Secondary Confirmed Cases Per Outbreak",
+                          outbreak_duration ~ "Outbreak Duration (days)",
+            outbreak_size_confirmed ~ "Total Confirmed Outbreak Size")
+      ) 
+  ) %>% 
+  as_flex_table() %>%
+  autofit() %>%
+  fontsize(size = 8) %>%
+  width(width = 0.9)  # Adjust the width as needed to prevent cutoff 
+  #gtsave(filename = "table3.png") # to save output
+```
+
+\newpage
+
+## Secondary Outcomes
+
+The secondary outcomes were the outcomes of each resident infected with a virus categorized into recovered at home, transfer to an acute care institution or death. And then separated by virus.
+
+```{r}
+#| echo: false
+#| warning: false
+
+#case outcomes by allocation arm
+db_final %>%
+  select(allocation_f, virus, case_outcome, combined_outcome, suspect_case) %>%
+  mutate(combined_outcome = case_when(case_outcome==1 ~ "Recovered",
+                                      case_outcome==2 ~ "Transfer to hospital",
+                                      TRUE~combined_outcome)) %>%
+  mutate(case_outcome = case_when(case_outcome==1~"Recovered",
+                                  case_outcome==2~"Transfer",
+                                  case_outcome==3~"Died",
+                                  TRUE~NA)) %>%
+  mutate(case_outcome=factor(case_outcome, 
+                             levels=c("Recovered",
+                                      "Transfer",
+                                      "Died"))) %>%
+  mutate(combined_outcome_f = case_when(combined_outcome=="Deceased within facility" &
+                                          suspect_case==1 ~ "Deceased within facility - Suspect", 
+                                        combined_outcome=="Transfer and deceased"&
+                                          suspect_case==1 ~ "Transfer and deceased - Suspect",
+                                        combined_outcome=="Transfer to hospital" &
+                                          suspect_case==1 ~ "Transfer to hospital - Suspect",
+                                        TRUE ~ combined_outcome)
+  ) %>%
+  mutate(combined_outcome_f=factor(combined_outcome_f, 
+                             levels=c("Recovered",
+                                      "Transfer to hospital",
+                                      "Transfer to hospital - Suspect",
+                                      "Transfer and deceased",
+                                      "Transfer and deceased - Suspect",
+                                      "Deceased within facility",
+                                      "Deceased within facility - Suspect"))) %>%
+  tbl_summary(
+    by = allocation_f,
+    include=c(virus, combined_outcome_f), #change what to include
+    statistic = list(
+      all_continuous() ~ "{median} ({p25}, {p75})",
+      all_categorical() ~ "{n} / {N} ({p}%)"
+    ),
+    digits = all_continuous() ~ 2,
+    missing_text = "(Missing)",
+    label=c(combined_outcome_f ~ "Outcomes", #change what to include
+            virus~"Virus")
+  ) %>%
+  add_overall() %>%
+   as_kable_extra(booktabs = TRUE)
+
+#outcomes by allocation by virus
+db_final %>%
+  #group_by(allocation_f, virus, case_outcome) %>%
+  #summarise(n=n()) %>%
+  #ungroup() %>% 
+  select(allocation_f, virus, case_outcome, combined_outcome, suspect_case) %>%
+  mutate(combined_outcome = case_when(case_outcome==1 ~ "Recovered",
+                                      case_outcome==2 ~ "Transfer to hospital",
+                                      TRUE~combined_outcome)) %>%
+  mutate(case_outcome = case_when(case_outcome==1~"Recovered",
+                                  case_outcome==2~"Transfer",
+                                  case_outcome==3~"Died",
+                                  TRUE~NA)) %>%
+  mutate(case_outcome=factor(case_outcome, 
+                             levels=c("Recovered",
+                                      "Transfer",
+                                      "Died"))) %>%
+  mutate(combined_outcome_f = case_when(combined_outcome=="Deceased within facility" &
+                                          suspect_case==1 ~ "Deceased within facility - Suspect", 
+                                        combined_outcome=="Transfer and deceased"&
+                                          suspect_case==1 ~ "Transfer and deceased - Suspect",
+                                        combined_outcome=="Transfer to hospital" &
+                                          suspect_case==1 ~ "Transfer to hospital - Suspect",
+                                        TRUE ~ combined_outcome)
+  ) %>%
+  mutate(combined_outcome_f=factor(combined_outcome_f, 
+                             levels=c("Recovered",
+                                      "Transfer to hospital",
+                                      "Transfer to hospital - Suspect",
+                                      "Transfer and deceased",
+                                      "Transfer and deceased - Suspect",
+                                      "Deceased within facility",
+                                      "Deceased within facility - Suspect"))) %>%
+  tbl_strata(
+    strata = virus,
+    .tbl_fun =
+      ~ .x |>
+      tbl_summary(by = allocation_f, 
+                  include=c(combined_outcome_f), #change what to include
+                  statistic = list(
+                    all_continuous() ~ "{median} ({p25}, {p75})",
+                    all_categorical() ~ "{n} / {N} ({p}%)"
+                  ),
+                  digits = all_continuous() ~ 2,
+                  missing_text = "(Missing)",
+                  label=c(combined_outcome_f ~ "Outcomes") #change what to include here
+      )
+  ) %>%
+  as_flex_table() %>%
+  autofit() %>%
+  fontsize(size = 8) %>%
+  width(width = 0.9)  # Adjust the width as needed to prevent cutoff 
+  #gtsave(filename = "table3.png") # to save output
+```
+
+\newpage
+
+Time from symptom onset to treatment.
+
+```{r}
+#| echo: false
+#| warning: false
+
+##### time to treatment
+t_treatment <- db_final %>%
+  filter(is.na(suspect_case)) %>%
+  select(study_id, allocation_f, treatment_f, treatment_start_date, case_symp_onset_f, virus) %>%
+  mutate(symp_treat_time = as.numeric(
+           difftime(as.POSIXct(treatment_start_date), as.POSIXct(case_symp_onset_f), units = "days")
+         ))
+
+#summarize treatment in a table
+# Create summary table
+t_treatment %>%
+  tbl_summary(
+    by = allocation_f,
+    include = c(treatment_f, symp_treat_time),
+    missing='no',
+    statistic = list(
+      all_continuous() ~ "{median} ({p25}, {p75})", 
+      all_categorical() ~ "{n} / {N} ({p}%)"
+    ),
+    digits = all_continuous() ~ 1,
+    label = list(
+      treatment_f ~ "Received Treatment",
+      symp_treat_time ~ "Time to Treatment (days)"
+    )
+  ) %>%
+  add_overall() %>%
+  as_kable_extra(booktabs = TRUE)
+
+#### table of overall and separated by virus
+# Create summary tables
+tbl_overall <- t_treatment %>%
+  tbl_summary(
+    by = allocation_f,
+    include = c(treatment_f, symp_treat_time),
+    missing = 'no',
+    statistic = list(
+      all_continuous() ~ "{median} ({p25}, {p75})",
+      all_categorical() ~ "{n} / {N} ({p}%)"
+    ),
+    digits = all_continuous() ~ 1,
+    label = list(
+      treatment_f ~ "Received Treatment",
+      symp_treat_time ~ "Time to Treatment (days)"
+    )
+  ) %>%
+  add_overall()
+
+tbl_covid <- t_treatment %>%
+  filter(virus == "COVID") %>%
+  tbl_summary(
+    by = allocation_f,
+    include = c(treatment_f, symp_treat_time),
+    missing = "no",
+    type = list(
+      symp_treat_time = "continuous"
+    ),
+    statistic = list(
+      all_continuous() ~ "{median} ({p25}, {p75})",
+      all_categorical() ~ "{n} / {N} ({p}%)"
+    ),
+    digits = all_continuous() ~ 1,
+    label = list(
+      treatment_f = "Received Treatment",
+      symp_treat_time = "Time to Treatment (days)"
+    )
+  ) %>%
+  add_overall()
+
+
+tbl_flu <- t_treatment %>%
+  filter(virus == "FLU") %>%
+  tbl_summary(
+    by = allocation_f,
+    include = c(treatment_f, symp_treat_time),
+    missing = 'no',
+    statistic = list(
+      all_continuous() ~ "{median} ({p25}, {p75})",
+      all_categorical() ~ "{n} / {N} ({p}%)"
+    ),
+    digits = all_continuous() ~ 1,
+    label = list(
+      treatment_f ~ "Received Treatment",
+      symp_treat_time ~ "Time to Treatment (days)"
+    )
+  ) %>%
+  add_overall()
+
+# Stack with headers
+tbl_stack(
+  list(tbl_overall, tbl_covid, tbl_flu),
+  group_header = c("Overall", "COVID", "FLU")
+) %>%
+  as_kable_extra(booktabs = TRUE)
+
+#graph time from symptom onset to treatment
+treat_1 <- t_treatment %>%
+  mutate(virus = case_when(virus== "COVID" ~ "SARS-CoV-2",
+                           virus== "RSV" ~ "RSV",
+                           virus== "FLU" ~ "Influenza",
+                           TRUE ~ "NACHO"),
+         virus = factor(virus, levels = c("SARS-CoV-2", "Influenza", "RSV"))) %>%
+  filter(virus!="RSV") %>%
+  ggplot(aes(x=allocation_f, y=symp_treat_time)) +
+  geom_boxplot(outlier.shape = NA) + 
+  geom_jitter(width = 0.2) +
+  theme_classic() + 
+  labs(y="Days from Symptom Onset to Treatment",
+       x="Allocation") 
+treat_2 <- t_treatment %>%
+  mutate(virus = case_when(virus== "COVID" ~ "SARS-CoV-2",
+                           virus== "RSV" ~ "RSV",
+                           virus== "FLU" ~ "Influenza",
+                           TRUE ~ "NACHO"),
+         virus = factor(virus, levels = c("SARS-CoV-2", "Influenza", "RSV"))) %>%
+  filter(virus!="RSV") %>%
+  ggplot(aes(x=allocation_f, y=symp_treat_time)) +
+  geom_boxplot(outlier.shape = NA) + 
+  geom_jitter(width = 0.2) +
+  theme_classic() + 
+  labs(y="Days from Symptom Onset to Treatment",
+       x="Allocation") +
+  facet_grid(~virus)
+
+time_treatment <- treat_1 + treat_2 + plot_layout(widths = c(1, 2)) + plot_annotation(tag_levels = 'A')
+time_treatment
+
+#save peg
+ggsave(time_treatment, filename = "treatment_time.jpeg", width = 8, # width in inches
+  height = 6,        # height in inches
+  dpi = 300)
+
+#time to oseltamivir treatment start for flu
+time_tr_flu <- glm(symp_treat_time ~ allocation_f, 
+               family="gaussian",
+               data=subset(t_treatment, c(virus=="FLU" & treatment_f=="Yes")))
+summary(time_tr_flu)
+avg_predictions(time_tr_flu, by = "allocation_f")
+avg_comparisons(time_tr_flu, variables = "allocation_f")
+
+#time to oseltamivir treatment start for covid
+time_tr_covid <- glm(symp_treat_time ~ allocation_f, 
+               family="gaussian",
+               data=subset(t_treatment, c(virus=="COVID" & treatment_f=="Yes")))
+summary(time_tr_covid)
+avg_predictions(time_tr_covid, by = "allocation_f")
+avg_comparisons(time_tr_covid, variables = "allocation_f")
+
+#time to antiviral treatment start fo
+time_tr_all <- glm(symp_treat_time ~ allocation_f + virus, 
+               family="gaussian",
+               data=subset(t_treatment, treatment_f=="Yes"))
+summary(time_tr_all)
+avg_predictions(time_tr_all, by = "allocation_f")
+avg_comparisons(time_tr_all, variables = "allocation_f")
+```
+
+\newpage
+
+```{r}
+#| echo: false
+#| warning: false
+#| include: false
+
+##number of outbreaks per unit per home by virus
+outbreak_num <- outbreak_size %>%
+  filter(outbreak_size!=1) %>% #remove those with only one case
+  group_by(home, unit, virus, allocation_f) %>%
+  count() %>%
+  group_by(home, unit, virus, allocation_f) %>%
+  dplyr::summarize(n=n()) 
+
+#add in virus for each home so all have flu/covid/rsv
+#remove the missing and non-covid/rsv/flu viruses
+outbreak_num <- right_join(outbreak_num, 
+                           expand.grid(home=toupper(letters[1:20]), 
+                                       virus=c("COVID","FLU","RSV"))) %>%
+  select(-allocation_f) %>%
+  mutate(n=replace_na(n,0))
+
+#load randomization database
+library(readxl)
+random <- read_excel("prompt_ltc_home_unit_key_scrambled_07april2025.xlsx") %>%
+  select(-allocation_f) %>%
+  right_join(read_excel("randomization_key_08jan2025.xlsx") %>%
+  mutate(allocation_f = case_when(allocation=="Platform" ~ "Intervention",
+                                  allocation=="Control" ~ "Control")))
+
+#add in all viruses for all units in each home
+out_num <- random %>% 
+  cross_join(tibble(virus=c("COVID","FLU","RSV"))) %>%
+  left_join(outbreak_num) %>%
+  mutate(n=replace_na(n,0),
+         home_virus = paste(home, virus))
+
+#outbreak numbers model
+library(lme4)
+m1 <- glmer(n ~ allocation_f + virus +
+                   (1|home), 
+                 data=out_num, family = "poisson")
+summary(m1)
+
+#outbreak size model
+outbreak_size_model <- outbreak_size %>%
+  filter(outbreak_size!=1) %>% #remove those with only one case
+  mutate(outbreak_size_initial = outbreak_size-outbreak_size_secondary, #case number on day 1
+         noncases = beds-outbreak_size_initial, #susceptible cases on each unit
+         home_virus = paste(home, virus)) %>% #combine for one variable of home/unit if needed
+  ungroup() %>%
+  group_by(home, unit, virus) %>%
+  mutate(outbreak_virus_num = row_number())
+
+#outbreak size model with number of prior cases being used to create non-cases
+#now set up model database
+outbreak_size_model_y <- outbreak_size %>%
+  filter(outbreak_size != 1) %>%  # Remove single-case outbreaks
+  mutate(
+    home_virus = paste(home, virus),
+    outbreak_size_initial = outbreak_size-outbreak_size_secondary #case number on day 1
+  ) %>%
+  group_by(home, unit, virus) %>%
+  arrange(home, unit, virus, outbreak_start) %>%  # Ensure correct order
+  mutate(
+    outbreak_virus_num = row_number(),
+    prior_outbreak_size_total = lag(cumsum(outbreak_size), default = 0),
+    noncases = beds - prior_outbreak_size_total - outbreak_size
+  ) %>%
+  ungroup()
+    
+#model outbreak size (secondary cases)  
+m2 <- glmer (cbind(outbreak_size_secondary, noncases) ~ 
+               allocation_f + virus + (1|home), 
+             family="binomial",
+             data=outbreak_size_model_y)
+summary(m2)
+
+#combine models
+library(metafor)
+model_combo <- rma(yi=c(fixef(m1)[2], fixef(m2)[2]),
+    vi = c(vcov(m1)[2,2], vcov(m2)[2,2]),
+    method="FE")
+
+#model proportion of outbreak that are secondary cases
+m3 <- glmer(
+  cbind(outbreak_size_secondary, outbreak_size - outbreak_size_secondary) ~ allocation_f + 
+    virus + (1|home),
+  family = "binomial",
+  data = outbreak_size_model_y
+)
+```
+
+```{r abs-risk-death, echo=FALSE, message=FALSE, warning=FALSE}
+
+#deaths per outbreak
+deaths_ob <- db_final %>% 
+  filter(outbreak_size!=1) %>%
+  group_by(home, unit, virus, outbreak_num, allocation_f, beds,
+           outbreak_start, outbreak_end) %>%
+  mutate(timing = as.numeric(difftime(case_symp_onset_f,
+                                      outbreak_start,
+                                      units = "days")),
+         suspect_case = replace_na(suspect_case, 0)) %>%
+  #filter(timing>0) %>% #include or exclude initial cases
+  mutate(rowid = row_number(),
+         death= case_when(case_outcome==3 ~ 1,
+                          TRUE ~0),
+         death_14d=as.factor(case_when(as.numeric(difftime(case_death_date,
+                                      case_symp_onset_f,
+                                      units = "days"))<14 ~ "death14",
+                             TRUE ~"no_death")))
+#model deaths per outbreak among cases
+model_death_logistic_agg <- glmer(
+  death ~ allocation_f + virus + (1 | home),
+  family = binomial(link = "logit"),
+  data = deaths_ob
+)
+#model deaths within 14d per outbreak among cases
+model_death_logistic_agg_14d <- glmmTMB(
+  death_14d ~ allocation_f + virus + (1 | home),
+  family = binomial(link = "logit"),
+  data = deaths_ob
+)
+
+#confirmed deaths (ie exclusion of suspect cases)
+model_death_logistic_agg_c <- glmer(
+  death ~ allocation_f + virus + (1 | home),
+  family = binomial(link = "logit"),
+  data = subset(deaths_ob, suspect_case==0)
+)
+```
+
+```{r abs-risk-transfer, echo=FALSE, message=FALSE, warning=FALSE}
+
+#transfers per outbreak
+transfers_ob <- db_final %>% 
+  filter(outbreak_size!=1) %>%
+  group_by(home, unit, virus, outbreak_num, allocation_f, beds,
+           outbreak_start, outbreak_end) %>%
+  mutate(timing = as.numeric(difftime(case_symp_onset_f,
+                                      outbreak_start,
+                                      units = "days")),
+         suspect_case = replace_na(suspect_case, 0)) %>%
+  #filter(timing>0) %>% #include or exclude initial cases
+  mutate(rowid = row_number(),
+         transfer= case_when(case_outcome==2 ~ 1,
+                          TRUE ~0),
+         transfer_14d=as.factor(case_when(as.numeric(difftime(case_hosp_transfer_date,
+                                      case_symp_onset_f,
+                                      units = "days"))<14 ~ "transfer14",
+                             TRUE ~"no_transfer")))
+#model transfers per outbreak per number of secondary cases
+model_transfer_logistic_agg <- glmmTMB(
+  transfer ~ allocation_f + virus + (1 | home),
+  family = binomial(link = "logit"),
+  data = transfers_ob
+)
+#model transfers per outbreak per number of secondary cases
+model_transfer_logistic_agg_14d <- glmmTMB(
+  transfer_14d ~ allocation_f + virus + (1 | home),
+  family = binomial(link = "logit"),
+  data = transfers_ob
+)
+
+#model transfers per outbreak per number of secondary cases for confirmed cases only
+model_transfer_logistic_agg_c <- glmmTMB(
+  transfer ~ allocation_f + virus + (1 | home),
+  family = binomial(link = "logit"),
+  data = subset(transfers_ob, suspect_case==0)
+)
+```
+
+\newpage
+
+## Model Outcomes
+
+```{r, results='asis'}
+#| echo: false
+#| warning: false
+
+# Source the helpers
+source("model_summary_helpers.R")
+
+# Define models with their outcome labels
+binary_models <- list(
+  "Death" = model_death_logistic_agg,
+  "Death - Confirmed" = model_death_logistic_agg_c,
+  "Transfer" = model_transfer_logistic_agg,
+  "Transfer - Confirmed" = model_transfer_logistic_agg_c,
+  "Death - 14 Days" = model_death_logistic_agg_14d,
+  "Transfer - 14 Days" = model_transfer_logistic_agg_14d,
+  "Secondary Transmission" = m2,
+  "Proportion of Secondary Cases per Outbreak" = m3,
+  "Secondary Transmission - Confirmed" = m2_c,
+  "Proportion of Secondary Cases per Outbreak - Confirmed" = m3_c
+)
+
+# Define count models with newdata for predictions
+count_models <- list(
+  list(model = m1, label = "Outbreaks", newdata = datagrid(model = m1, allocation_f = c("Control", "Intervention"), virus = "COVID"))
+)
+
+# Create summary for all binary models
+binary_summaries <- lapply(names(binary_models), function(label) {
+  process_binary_model(binary_models[[label]], label)
+})
+
+# Create summary for all count models
+count_summaries <- lapply(count_models, function(x) {
+  process_count_model(x$model, x$label, newdata = x$newdata)
+})
+
+#create summary for outbreak size
+outbreak_models <- list(
+  list(model = m2, label = "Predicted Outbreak Size", newdata = outbreak_size_model_y),
+  list(model = m2_c, label = "Predicted Outbreak Size - Confirmed", newdata = outbreak_size_model_y)
+)
+#run models
+outbreak_summaries <- lapply(outbreak_models, function(x) {
+  process_outbreak_size_model(
+    model = x$model,
+    data = x$newdata,
+    outcome_label = x$label
+  )
+})
+
+# Combine all results
+final_summary_table <- bind_rows(count_summaries, binary_summaries) 
+final_summary_table <- bind_rows(final_summary_table, outbreak_summaries) 
+
+#order
+final_summary_table <- final_summary_table %>%
+  mutate(Outcome = factor(Outcome, levels = c("Death", "Death - Confirmed",
+                                              "Transfer", "Transfer - Confirmed",
+                                              "Outbreaks", 
+                                              "Secondary Transmission",
+                                              "Secondary Transmission - Confirmed",
+                                              "Proportion of Secondary Cases per Outbreak",
+                                              "Proportion of Secondary Cases per Outbreak - Confirmed",
+                                              "Death - 14 Days",
+                                              "Transfer - 14 Days",
+                                              "Predicted Outbreak Size",
+                                              "Predicted Outbreak Size - Confirmed"))) %>%
+  arrange(Outcome)
+
+#make nice with gt
+final <- final_summary_table %>%
+  select(
+    Outcome,
+    Control,
+    Treatment,
+    `Risk Difference`,
+    OR_CI,
+    p_value
+  ) %>%
+  gt() %>%
+  tab_header(
+    title = md("**Outcome Summary by Allocation Group**")
+  ) %>%
+  cols_label(
+    Outcome = "Outcome",
+    Control = "Control",
+    Treatment = "Intervention",
+    `Risk Difference` = "Absolute Difference (Intervention − Control, 95% CI)",
+    OR_CI = "Odds Ratio (95% CI)",
+    p_value = "p-value"
+  ) %>%
+  tab_spanner(
+    label = "Absolute Risk",
+    columns = c(Control, Treatment)
+  ) %>%
+  cols_align("center", columns = everything()) %>%
+  opt_row_striping() %>%
+  tab_options(
+    table.font.size = px(12),
+    table.width = pct(100)
+  ) %>%
+  tab_source_note(
+    source_note = md("*Incidence Rate Ratio instead of Odds Ratio")
+  )
+
+# Save as PNG 
+gtsave(final, filename = "summary_table.png")
+
+
+```
+
+\newpage
+
+## Subgroup Analyses - by Viruses
+
+Models are re-run with COVID or Influenza alone.
+
+```{r}
+#| echo: false
+#| warning: false
+
+#run models for influenza alone
+model_death_logistic_agg_f <- glmer(
+  death ~ allocation_f + (1 | home),
+  family = binomial(link = "logit"),
+  data = subset(deaths_ob, virus=="FLU")
+)
+
+model_transfer_logistic_agg_f <- glmer(
+  transfer ~ allocation_f + (1 | home),
+  family = binomial(link = "logit"),
+  data = subset(transfers_ob, virus=="FLU")
+)
+
+m1_f <- glmer(n ~ allocation_f +
+                   (1|home), 
+                 data=subset(out_num, virus=="FLU"), family = "poisson")
+
+m2_f <- glmer (cbind(outbreak_size_secondary, noncases) ~ 
+               allocation_f + (1|home), 
+             family="binomial",
+             data=subset(outbreak_size_model_y, virus=="FLU"))
+
+m3_f <- glmer(
+  cbind(outbreak_size_secondary, outbreak_size - outbreak_size_secondary) ~ allocation_f + (1|home),
+  family = "binomial",
+  data = subset(outbreak_size_model_y, virus=="FLU")
+)
+
+# Source the helpers
+source("model_summary_helpers.R")
+
+# Define models with their outcome labels
+binary_models <- list(
+  "Death" = model_death_logistic_agg_f,
+  "Transfer" = model_transfer_logistic_agg_f,
+  "Secondary Transmission" = m2_f,
+  "Proportion of Secondary Cases per Outbreak" = m3_f
+)
+
+# Define count models with newdata for predictions
+count_models_f <- list(
+  list(model = m1_f, label = "Outbreaks", newdata = datagrid(model = m1, allocation_f = c("Control", "Intervention")))
+)
+
+# Create summary for all binary models
+binary_summaries_f <- lapply(names(binary_models), function(label) {
+  process_binary_model(binary_models[[label]], label)
+})
+
+# Create summary for all count models
+count_summaries_f <- lapply(count_models_f, function(x) {
+  process_count_model(x$model, x$label, newdata = x$newdata)
+})
+
+#create summary for outbreak size
+outbreak_summaries_f <- process_outbreak_size_model(
+  model = m2_f,
+  data = outbreak_size_model_y,
+  outcome_label = "Predicted Outbreak Size"
+)
+
+# Combine all results
+final_table_all_f <- bind_rows(binary_summaries_f, count_summaries_f)
+final_table_all_f <- bind_rows(final_table_all_f, outbreak_summaries_f)
+```
+
+```{r}
+#| echo: false
+#| warning: false
+
+#run models for covid alone
+model_death_logistic_agg_f <- glmer(
+  death ~ allocation_f + (1 | home),
+  family = binomial(link = "logit"),
+  data = subset(deaths_ob, virus=="COVID")
+)
+
+model_transfer_logistic_agg_f <- glmer(
+  transfer ~ allocation_f + (1 | home),
+  family = binomial(link = "logit"),
+  data = subset(transfers_ob, virus=="COVID")
+)
+
+m1_f <- glmer(n ~ allocation_f +
+                   (1|home), 
+                 data=subset(out_num, virus=="COVID"), family = "poisson")
+
+m2_f <- glmer (cbind(outbreak_size_secondary, noncases) ~ 
+               allocation_f + (1|home), 
+             family="binomial",
+             data=subset(outbreak_size_model, virus=="COVID"))
+
+m3_f <- glmer(
+  cbind(outbreak_size_secondary, outbreak_size - outbreak_size_secondary) ~ allocation_f + (1|home),
+  family = "binomial",
+  data = subset(outbreak_size_model_y, virus=="COVID")
+)
+
+
+# Source the helpers
+source("model_summary_helpers.R")
+
+# Define models with their outcome labels
+binary_models <- list(
+  "Death" = model_death_logistic_agg_f,
+  "Transfer" = model_transfer_logistic_agg_f,
+  "Secondary Transmission" = m2_f,
+  "Proportion of Secondary Cases per Outbreak" = m3_f
+)
+
+# Define count models with newdata for predictions
+count_models_f <- list(
+  list(model = m1_f, label = "Outbreaks", newdata = datagrid(model = m1, allocation_f = c("Control", "Intervention")))
+)
+
+# Create summary for all binary models
+binary_summaries_f <- lapply(names(binary_models), function(label) {
+  process_binary_model(binary_models[[label]], label)
+})
+
+# Create summary for all count models
+count_summaries_f <- lapply(count_models_f, function(x) {
+  process_count_model(x$model, x$label, newdata = x$newdata)
+})
+
+#create summary for outbreak size
+outbreak_summaries_f <- process_outbreak_size_model(
+  model = m2_f,
+  data = outbreak_size_model_y,
+  outcome_label = "Predicted Outbreak Size"
+)
+
+# Combine all results
+final_table_all_covid <- bind_rows(binary_summaries_f, count_summaries_f)
+final_table_all_covid <- bind_rows(final_table_all_covid, outbreak_summaries_f)
+```
+
+\newpage
+
+## Overall Transfer/Death Rates
+
+```{r}
+#| echo: false
+#| warning: false
+
+#create master database of all outcomes from all outcomes over study period
+db_big <- left_join(db_check, db_final) %>%
+  select(dummy_id, home, unit, outcome_date, combined_outcome, case_outcome, study_id,
+         case_hosp_transfer_date, case_death_date, virus, outbreak_num) %>%
+  mutate(suspect_case = case_when(is.na(study_id) ~ 1,
+                                  TRUE ~ 0)) 
+#add in beds 
+random <- read_excel("prompt_ltc_home_unit_key_scrambled_07april2025.xlsx") %>%
+  select(-allocation_f) %>%
+  right_join(
+    read_excel("randomization_key_08jan2025.xlsx"),
+    by = "home"
+  ) %>%
+  right_join(
+    read_excel("prompt_ltc_home_key_crowd_oh.xlsx"),
+    by = "home"
+  ) %>%
+  mutate(
+    allocation_f = case_when(
+      allocation == "Platform" ~ "Intervention",
+      allocation == "Control" ~ "Control"
+    )
+  ) %>%
+  group_by(home, allocation, allocation_f) %>%
+  dplyr::summarize(
+    beds = sum(beds)
+  ) %>%
+  select(home, beds, allocation, allocation_f)
+  
+db_big <- left_join(db_big, random) 
+  
+#want rates per month per beds
+# Step 1: Ensure date format and extract month
+db_big <- db_big %>%
+  mutate(
+    outcome_date = as.Date(outcome_date),
+    month = floor_date(outcome_date, "month")
+  )
+
+#Need beds per home
+beds_per_home <- read_excel("prompt_ltc_home_unit_key_scrambled_07april2025.xlsx") %>%
+  select(-allocation_f) %>%
+  right_join(read_excel("randomization_key_08jan2025.xlsx") %>%
+  right_join(read_excel("prompt_ltc_home_key_crowd_oh.xlsx")) %>%
+  mutate(allocation_f = case_when(allocation=="Platform" ~ "Intervention",
+                                  allocation=="Control" ~ "Control"))) %>%
+  select(allocation_f, home, beds) %>%
+  group_by(allocation_f) %>%
+  dplyr::summarize(
+    beds = sum(beds, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Step 2: Aggregate outcome counts per group
+outcome_counts <- db_big %>%
+  filter(!is.na(combined_outcome)) %>%
+  group_by(month, allocation_f, combined_outcome) %>%
+  summarize(
+    n = n()
+  )
+
+# Step 3: Create complete grid of all combinations to fill 0s
+all_combinations <- crossing(
+  month = seq(min(db_big$month, na.rm = TRUE), max(db_big$month, na.rm = TRUE), by = "month"),
+  allocation_f = unique(db_big$allocation_f),
+  combined_outcome = unique(db_big$combined_outcome)
+)
+
+# Step 4: Merge and compute rate per 100 beds
+rates_df <- all_combinations %>%
+  left_join(outcome_counts, by = c("month", "allocation_f", "combined_outcome")) %>%
+  left_join(beds_per_home, by = "allocation_f") %>%
+  mutate(
+    n = replace_na(n, 0),
+    rate_per_bed = (n / beds) * 100
+  ) %>%
+  select(month, allocation_f, combined_outcome, n, beds, rate_per_bed)
+
+# Step 5: Filter out invalid or placeholder allocations if needed
+rates_df <- rates_df %>%
+  filter(!combined_outcome %in% c("", NA))
+  
+#plot monthly rates of transfers/deaths between allocation groups
+library(wesanderson)
+pp_1 <- rates_df %>%
+  filter(month<"2025-05-01") %>%
+  ggplot(aes(x = month, y = rate_per_bed, fill = combined_outcome)) +
+  geom_bar(stat = "identity") +
+  labs(
+    #title = "Monthly Rate per Bed by Combined Outcome",
+    x = "Month",
+    y = "Rate of resident hospital transfer or death per 100 Beds",
+    fill = "Outcome"
+  ) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  scale_x_date(
+    date_breaks = "1 months",
+    date_labels = "%b %Y"
+  ) +
+  #scale_fill_manual(values = wesanderson::wes_palette("Royal1", n = length(unique(rates_df$combined_outcome)), type = "discrete")) +
+  scale_fill_grey(start = 0.3, end = 0.8) +
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  ) +
+  facet_grid(allocation_f~.)
+```
